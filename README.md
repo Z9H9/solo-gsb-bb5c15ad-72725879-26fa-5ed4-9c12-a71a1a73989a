@@ -183,6 +183,78 @@ curl -X POST http://localhost:8000/api/v1/neutral-profile \
   -d '{"formula":"C6H12O6","resolving_power":100000,"mass_step":0.001}'
 ```
 
+### `POST /api/v1/profile-centroid`
+
+将客户端提交的**等间距连续轮廓**（mass/intensity 采样点）转换为**质心峰**（centroid）。典型用法是把 `/api/v1/neutral-profile` 的输出直接回本接口，得到可用于富集拟合/离子识别的棒谱。
+
+请求体：
+
+```json
+{
+  "profile": [
+    {"mass": 100.0, "intensity": 0.0},
+    {"mass": 100.001, "intensity": 0.5},
+    {"mass": 100.002, "intensity": 4.0}
+  ],
+  "relative_threshold": 1.0,
+  "min_separation": 0.005
+}
+```
+
+- `profile`（必填，**3～20000 个点**）：连续轮廓采样点，字段为 `mass`/`intensity`：
+  - `mass` 必须**严格递增**；
+  - 网格必须等间距——以第一个间距为参考步长，其后每个间距与参考步长的**相对误差不得超过 1e-6**（即 `|gap − step| / step ≤ 1e-6`），否则按首个违规间距的 0 基索引返回 422；
+  - `intensity` 非负（允许 0），且**至少一个为正**；mass/intensity 都必须是有限数。
+- `relative_threshold`（必填，**0～100**）：相对阈值（百分比）。轮廓先按基峰归一化（最高点 = 100），归一化强度**低于**该阈值的点在寻峰前丢弃（恰好等于阈值保留）。
+- `min_separation`（必填，**>0**，Da）：非极大值抑制（NMS）的最小峰间距。
+
+处理流程：
+
+1. **归一化与阈值过滤**：按基峰归一化到 100，丢弃阈值以下的点（比较含 1e-9 量级的浮点容差，保证阈值 100 时基峰平台不被舍入误差误删）。
+2. **平顶局部极大候选**：在阈值以上的点中，把每个"平顶局部极大区间"视为一个候选——一段强度相同、且两侧紧邻点（边界外侧视为无限低）都严格更低的**连续等强游程**。候选**位置取平台中点**（平台两端点质量的平均，可能落在两个网格点之间），候选强度取平台归一化强度。
+3. **非极大值抑制**：候选按强度**降序**贪心处理，强度相同时**低质量优先**；若候选与任一已保留候选的距离小于 `min_separation`（恰等于 `min_separation` 允许，含浮点容差）则丢弃。
+4. **分配与质心**：将每个阈值以上的点分配给质量最近的保留候选，**等距时归低质量候选**；每个候选用**原始（未归一化）强度**计算：
+   - 质心质量 = Σ(m·I) / ΣI（只计分配给它的点）；
+   - 峰顶归一化强度 = 平台原始强度 × 100 / 基峰原始强度（平顶取平台高度，而非分配区域内的最大值）；
+   - 占总分配强度百分比 = 分配给它的原始强度和 / 全部阈值以上点原始强度和 × 100。
+5. 峰按**质量升序**返回。
+
+响应：
+
+```json
+{
+  "point_count": 27,
+  "relative_threshold": 1.0,
+  "min_separation": 0.005,
+  "candidate_count": 2,
+  "peak_count": 2,
+  "peaks": [
+    {"mass": 100.007, "intensity": 100.0, "total_intensity_percent": 87.356322},
+    {"mass": 100.021, "intensity": 25.0, "total_intensity_percent": 12.643678}
+  ]
+}
+```
+
+- `point_count`：输入轮廓点数；`candidate_count` 为 NMS 之前的平顶局部极大候选数；`peak_count` 为 NMS 之后实际返回的峰数。
+- `peaks`：每个峰含质心 `mass`（强度加权平均质量）、`intensity`（峰顶相对基峰的归一化强度）与 `total_intensity_percent`（占全部阈值以上分配强度的百分比，所有峰之和为 100），按质量升序。
+- 被 NMS 抑制候选附近的阈值以上点不会丢失，而是照常分配给最近的保留候选，因此保留峰的质心质量可能偏离其峰顶位置。
+
+非法输入返回带字段（必要时带 0 基点索引）的 422：
+
+- 点数不在 3～20000、强度为负或非有限：`error` 为 `invalid_profile`，`field` 为 `profile`（索引问题附 `index`）；
+- 质量非严格递增或网格间距相对误差超过 1e-6：`error` 为 `invalid_mass_grid`，`field` 为 `profile`，`index` 指向首个违规间距的右端点；
+- 全部强度为 0：`error` 为 `zero_profile`；
+- 阈值以上不存在任何局部极大候选：`error` 为 `no_candidates`，`field` 为 `relative_threshold`（正常输入下基峰平台恒为候选，仅在极端情形触发）；
+- `relative_threshold` 越界（不在 0～100）、`min_separation` ≤ 0、字段缺失等由请求校验返回标准 422。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/profile-centroid \
+  -H 'Content-Type: application/json' \
+  -d '{"relative_threshold":1.0,"min_separation":0.005,
+       "profile":[{"mass":100.0,"intensity":0.0},{"mass":100.001,"intensity":60.0},
+                  {"mass":100.002,"intensity":100.0},{"mass":100.003,"intensity":60.0}]}'
+```
+
 ### `POST /api/v1/ion-identify`
 
 在一个中性分子式上同时评估 **1～20 个候选加合物/电荷组合**：对每个候选复用 `/api/v1/ion-envelope` 的加合物解析与离子包络计算（含 `|charge| ×` 合并容差缩放与 m/z 换算、基峰归一化为 100），将预测 m/z 峰与观测 m/z 峰在容差内一对一配对，以全部配对（含未匹配峰）的强度均方误差对候选排序，返回全部候选的得分、配对明细与最佳候选。
@@ -552,6 +624,10 @@ curl -X POST http://localhost:8000/api/v1/ion-mixture-fit \
 - `invalid_mass_range`：`/api/v1/neutral-profile` 的质量区间为空或反向（`mass_min ≥ mass_max`，含单侧给定时与自动 ±4σ 边界比较的情形）；`field` 为 `mass_min`。
 - `grid_too_large`：统一网格点数超过 20000（放宽 `mass_step` 或缩窄质量区间）；`field` 为 `mass_step`。
 - `no_profile_points`：区间内没有任何网格点落入任一棒峰的 ±4σ 支撑窗（窗口离谱图太远或窄于一个步长）；`field` 为 `mass_min`。
+- `invalid_mass_grid`：`/api/v1/profile-centroid` 的质量网格非法——质量非严格递增，或某间距与首个间距的相对误差超过 1e-6；`field` 为 `profile`，`index` 为首个违规间距右端点的 0 基索引。
+- `invalid_profile`：`/api/v1/profile-centroid` 的轮廓点数不在 3～20000、强度为负或存在非有限值（`field` 为 `profile`，索引问题附 `index`）。
+- `zero_profile`：`/api/v1/profile-centroid` 的轮廓强度全部为零（至少需要一个正强度点）；`field` 为 `profile`。
+- `no_candidates`：`/api/v1/profile-centroid` 阈值过滤后不存在任何平顶局部极大候选；`field` 为 `relative_threshold`。
 
   ```json
   {
@@ -596,6 +672,7 @@ pytest                                 # 运行测试
 - **峰合并**：排序后相邻质量差 < 0.0001 Da 的峰融合为一个，质量取强度加权平均，强度取和。
 - **离子包络**：`POST /api/v1/ion-envelope` 将加合物（`app/adduct.py`，形如 `+2H-H2O` 的连续片段，系数乘整个片段）施加到解析后的原子计数上，用 `|charge| × MSPC_MERGE_TOLERANCE` 的中性质量容差卷积，再按 `(mass − charge·mₑ)/|charge|`（`mₑ = 0.000548579909065 Da`）逐峰换算为 m/z。
 - **仪器轮廓模拟**：`POST /api/v1/neutral-profile`（`app/profile.py`）复用中性包络卷积得到全部棒峰，对每根质量 m 的棒构造 `FWHM = m/resolving_power`、`σ = FWHM/(2√(2 ln 2))` 的高斯核，只在 ±4σ 内逐点累加到同一张等间距网格（`mass_step`），区间外的核截断、区间内贡献原样保留，再将全图基峰归一化为 100。省略范围时取所有棒 ±4σ 支撑窗的并集；网格点数超过 20000、区间为空/反向、步长非正或区间内无有效采样点均返回带 `field` 的 422。
+- **轮廓质心化**：`POST /api/v1/profile-centroid`（`app/centroid.py`）先校验 3～20000 点严格递增、等间距（各间距与首个间距相对误差 ≤ 1e-6）、非负且至少一个正强度；按基峰归一化后丢弃 `relative_threshold` 以下点（比较含微小浮点容差），将连续等强且两侧严格更低的游程识别为平顶局部极大（位置取平台两端质量中点），候选按归一化强度降序（同强度低质量优先）做 `min_separation` 非极大值抑制（恰等间距保留），再用二分最近邻把每个阈值以上点分配给最近保留候选（等距归低质量候选），以**原始强度**做强度加权得到质心质量、峰顶归一化强度（平台高度）与占总分配强度百分比，按质量升序返回；非法网格、全零轮廓或无候选返回带 `field`/`index` 的 422。
 - **离子识别**：`POST /api/v1/ion-identify`（`app/identify.py`）对 1～20 个候选（加合物, 电荷）逐个复用同一套加合物解析、离子包络计算与基峰归一化，观测峰同样归一化一次后复用；每个候选用与富集拟合相同的 `pair_and_score` 做容差内质量差全局从小到大的一对一贪心匹配，未匹配峰以零强度计入归一化 MSE。有效候选按 MSE 升序、输入索引作稳定平局键排序；非法候选捕获既有 `AdductError`（携带位置）后以 `valid: false` 附在结果末尾，不影响其他候选评分。
 - **离子混合拟合**：`POST /api/v1/ion-mixture-fit`（`app/mixture.py`）对 2～10 个候选中的每个有效候选复用 `app/identify.py` 的基峰归一化离子包络；枚举无序候选对（按请求索引升序，索引较小者为第一候选）与 0～100% 的第一候选比例网格（复用富集拟合的 `abundance_grid`，100% 端点始终包含），将两个归一化包络按比例加权叠加——两包络间 `mass_tolerance` 内的峰按强度加权质量融合、强度求和（复用 `merge_peaks`；比例为 0%/100% 时跳过另一侧，即纯包络）——混合谱再次基峰归一化后与观测峰做同一套 `pair_and_score` 一对一配对，双侧未匹配峰以零强度计入 MSE。全部组合按 (MSE, 候选索引对, 第一候选比例) 升序排名，首名即最佳组合（平局依次取较小索引对、较低首候选比例）；非法候选以 `valid: false` 返回既有位置错误并跳过其所有组合，有效候选少于两个时组合列表为空、最佳组合为 `null`。
 - **单同位素质量**：按 IUPAC 惯例取各元素天然丰度最高的同位素质量之和。

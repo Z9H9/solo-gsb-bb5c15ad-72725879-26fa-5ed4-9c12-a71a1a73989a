@@ -6,11 +6,14 @@ import math
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import __version__, db
 from .adduct import AdductError, apply_adduct, parse_adduct
+from .centroid import CentroidError, centroid_profile
 from .config import settings
 from .enrichment import (
     LabelCombinationError,
@@ -53,8 +56,9 @@ app = FastAPI(
         "estimates single-isotope enrichment by fitting candidate "
         "abundances against observed peaks, jointly fits two isotopes of "
         "different elements on a 2-D abundance grid, fits pairwise "
-        "0-100% mixtures of candidate adduct/charge ion envelopes, and "
-        "simulates Gaussian instrument profiles of neutral stick spectra."
+        "0-100% mixtures of candidate adduct/charge ion envelopes, "
+        "simulates Gaussian instrument profiles of neutral stick spectra, "
+        "and centroids equally-spaced continuous mass/intensity profiles."
     ),
     lifespan=lifespan,
 )
@@ -203,6 +207,98 @@ class NeutralProfileResponse(BaseModel):
     mass_step: float
     point_count: int
     profile: list[NeutralProfilePointOut]
+
+
+class ProfilePointIn(BaseModel):
+    mass: float = Field(
+        ...,
+        description=(
+            "Sample mass (Da); the series must be strictly increasing on a "
+            "uniform grid (constant step within a 1e-6 relative error)"
+        ),
+    )
+    intensity: float = Field(
+        ...,
+        ge=0,
+        description="Sample intensity (non-negative; at least one must be positive)",
+    )
+
+
+class ProfileCentroidRequest(BaseModel):
+    profile: list[ProfilePointIn] = Field(
+        ...,
+        min_length=3,
+        max_length=20000,
+        description=(
+            "Equally-spaced continuous profile, 3-20000 points with strictly "
+            "increasing masses"
+        ),
+    )
+    relative_threshold: float = Field(
+        ...,
+        ge=0,
+        le=100,
+        description=(
+            "Points whose base-peak-normalised intensity (base peak = 100) "
+            "is below this percentage are discarded before peak picking"
+        ),
+        examples=[5.0],
+    )
+    min_separation: float = Field(
+        ...,
+        gt=0,
+        description=(
+            "Minimum mass separation (Da) between reported peaks; non-maximum "
+            "suppression keeps the strongest candidate within each window"
+        ),
+        examples=[0.01],
+    )
+
+    @field_validator("relative_threshold", "min_separation")
+    @classmethod
+    def values_must_be_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("value must be a finite number")
+        return value
+
+    @field_validator("profile")
+    @classmethod
+    def points_must_be_finite(cls, value: list[ProfilePointIn]) -> list[ProfilePointIn]:
+        for point in value:
+            if not math.isfinite(point.mass) or not math.isfinite(point.intensity):
+                raise ValueError("mass and intensity must be finite numbers")
+        return value
+
+
+class CentroidPeakOut(BaseModel):
+    mass: float = Field(
+        ..., description="Intensity-weighted centroid mass (Da) of the assigned points"
+    )
+    intensity: float = Field(
+        ...,
+        description=(
+            "Peak-top intensity normalised to the profile base peak (100); "
+            "for a flat-topped plateau this is the plateau level"
+        ),
+    )
+    total_intensity_percent: float = Field(
+        ...,
+        description=(
+            "Sum of the original intensities assigned to this peak as a "
+            "percentage of all assigned above-threshold intensity"
+        ),
+    )
+
+
+class ProfileCentroidResponse(BaseModel):
+    point_count: int
+    relative_threshold: float
+    min_separation: float
+    candidate_count: int = Field(
+        ..., description="Number of flat-topped local-maximum candidates before NMS"
+    )
+    peak_count: int
+    peaks: list[CentroidPeakOut]
 
 
 class ObservedPeak(BaseModel):
@@ -590,6 +686,42 @@ async def profile_parameter_error_handler(
     )
 
 
+@app.exception_handler(CentroidError)
+async def centroid_error_handler(request: Request, exc: CentroidError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": {
+                "error": exc.error,
+                "message": exc.message,
+                "field": exc.field,
+                "index": exc.index,
+            }
+        },
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    # Mirror FastAPI's default 422 body, but sanitise non-finite floats in
+    # the echoed input so a literal NaN/Infinity request value stays JSON
+    # encodable instead of failing response rendering.
+    detail = jsonable_encoder(exc.errors())
+
+    def _sanitise(value):
+        if isinstance(value, float):
+            return value if math.isfinite(value) else str(value)
+        if isinstance(value, dict):
+            return {key: _sanitise(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [_sanitise(item) for item in value]
+        return value
+
+    return JSONResponse(status_code=422, content={"detail": _sanitise(detail)})
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "version": __version__}
@@ -720,6 +852,41 @@ def neutral_profile(req: NeutralProfileRequest) -> dict:
         "profile": [
             {"mass": mass, "intensity": round(intensity, 6)}
             for mass, intensity in result.profile
+        ],
+    }
+
+
+@app.post("/api/v1/profile-centroid", response_model=ProfileCentroidResponse)
+def profile_centroid(req: ProfileCentroidRequest) -> dict:
+    """Convert an equally-spaced continuous profile into centroid peaks.
+
+    The submitted grid is base-peak normalised and points below
+    ``relative_threshold`` are discarded; flat-topped local maxima (one per
+    plateau, positioned at the plateau midpoint) are picked as candidates,
+    suppressed with a descending-intensity (lower mass on ties)
+    ``min_separation`` non-maximum suppression, and each above-threshold
+    point is assigned to its nearest surviving candidate (equidistant
+    points go to the lower-mass one). Peak masses are intensity-weighted
+    centroids over the *original* intensities; peaks are returned by
+    ascending mass.
+    """
+    points = [(p.mass, p.intensity) for p in req.profile]
+    result = centroid_profile(
+        points, req.relative_threshold, req.min_separation
+    )
+    return {
+        "point_count": result.point_count,
+        "relative_threshold": result.relative_threshold,
+        "min_separation": result.min_separation,
+        "candidate_count": result.candidate_count,
+        "peak_count": len(result.peaks),
+        "peaks": [
+            {
+                "mass": round(peak.mass, 6),
+                "intensity": round(peak.intensity, 6),
+                "total_intensity_percent": round(peak.total_intensity_percent, 6),
+            }
+            for peak in result.peaks
         ],
     }
 
