@@ -11,6 +11,12 @@ from pydantic import BaseModel, Field, field_validator
 
 from . import __version__, db
 from .adduct import AdductError, apply_adduct, parse_adduct
+from .centroid import (
+    MAX_POINTS,
+    MIN_POINTS,
+    ProfileGridError,
+    centroid_profile,
+)
 from .config import settings
 from .enrichment import (
     LabelCombinationError,
@@ -53,8 +59,10 @@ app = FastAPI(
         "estimates single-isotope enrichment by fitting candidate "
         "abundances against observed peaks, jointly fits two isotopes of "
         "different elements on a 2-D abundance grid, fits pairwise "
-        "0-100% mixtures of candidate adduct/charge ion envelopes, and "
-        "simulates Gaussian instrument profiles of neutral stick spectra."
+        "0-100% mixtures of candidate adduct/charge ion envelopes, "
+        "simulates Gaussian instrument profiles of neutral stick spectra, "
+        "and centroids uniformly spaced mass/intensity profiles into "
+        "centroid peaks."
     ),
     lifespan=lifespan,
 )
@@ -203,6 +211,72 @@ class NeutralProfileResponse(BaseModel):
     mass_step: float
     point_count: int
     profile: list[NeutralProfilePointOut]
+
+
+class ProfilePointIn(BaseModel):
+    mass: float = Field(..., description="Profile point mass (Da)")
+    intensity: float = Field(..., ge=0, description="Profile point intensity")
+
+    @field_validator("mass", "intensity")
+    @classmethod
+    def values_must_be_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("value must be a finite number")
+        return value
+
+
+class ProfileCentroidRequest(BaseModel):
+    points: list[ProfilePointIn] = Field(
+        ...,
+        min_length=MIN_POINTS,
+        max_length=MAX_POINTS,
+        description=(
+            "Uniformly spaced profile points with strictly increasing "
+            "masses and non-negative intensities (at least one positive)"
+        ),
+    )
+    relative_threshold: float = Field(
+        ...,
+        ge=0,
+        le=100,
+        description=(
+            "Points at or below this percentage of the base peak are "
+            "discarded before peak picking (0-100)"
+        ),
+        examples=[1.0],
+    )
+    min_separation: float = Field(
+        ...,
+        gt=0,
+        description=(
+            "Minimum mass separation (Da) between retained centroid "
+            "candidates (non-maximum suppression)"
+        ),
+        examples=[0.05],
+    )
+
+    @field_validator("relative_threshold", "min_separation")
+    @classmethod
+    def values_must_be_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("value must be a finite number")
+        return value
+
+
+class CentroidPeakOut(BaseModel):
+    mass: float
+    apex_intensity: float
+    intensity_percent: float
+
+
+class ProfileCentroidResponse(BaseModel):
+    point_count: int
+    mass_step: float
+    relative_threshold: float
+    min_separation: float
+    candidate_count: int
+    peak_count: int
+    peaks: list[CentroidPeakOut]
 
 
 class ObservedPeak(BaseModel):
@@ -590,6 +664,23 @@ async def profile_parameter_error_handler(
     )
 
 
+@app.exception_handler(ProfileGridError)
+async def profile_grid_error_handler(
+    request: Request, exc: ProfileGridError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": {
+                "error": exc.error,
+                "message": exc.message,
+                "field": exc.field,
+                "index": exc.index,
+            }
+        },
+    )
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "version": __version__}
@@ -720,6 +811,50 @@ def neutral_profile(req: NeutralProfileRequest) -> dict:
         "profile": [
             {"mass": mass, "intensity": round(intensity, 6)}
             for mass, intensity in result.profile
+        ],
+    }
+
+
+@app.post("/api/v1/profile-centroid", response_model=ProfileCentroidResponse)
+def profile_centroid(req: ProfileCentroidRequest) -> dict:
+    """Convert a uniformly spaced mass/intensity profile into centroid peaks.
+
+    The grid is validated (3-20000 strictly increasing masses whose
+    consecutive steps deviate from the mean step by at most 1e-6 relative,
+    non-negative intensities with at least one positive point). Intensities
+    are base-peak normalised and points at or below ``relative_threshold``
+    percent are dropped; each flat-top local-maximum interval of the
+    remaining points becomes a candidate at its plateau midpoint. Candidates
+    undergo ``min_separation`` non-maximum suppression (strongest first,
+    intensity ties to the lower mass), then every above-threshold point is
+    assigned to its nearest retained candidate (equidistant points to the
+    lower-mass one). With the original intensities each retained candidate
+    reports its intensity-weighted centroid mass, the plateau's normalised
+    apex intensity and the cluster's share of the total assigned intensity;
+    peaks are returned sorted by ascending centroid mass.
+    """
+    masses = [p.mass for p in req.points]
+    intensities = [p.intensity for p in req.points]
+    result = centroid_profile(
+        masses, intensities, req.relative_threshold, req.min_separation
+    )
+    db.log_request(
+        "profile-centroid", None, ok=True, message="profile centroid computed"
+    )
+    return {
+        "point_count": result.point_count,
+        "mass_step": result.mass_step,
+        "relative_threshold": req.relative_threshold,
+        "min_separation": req.min_separation,
+        "candidate_count": result.candidate_count,
+        "peak_count": len(result.peaks),
+        "peaks": [
+            {
+                "mass": round(p.mass, 6),
+                "apex_intensity": round(p.apex_intensity, 6),
+                "intensity_percent": round(p.intensity_percent, 6),
+            }
+            for p in result.peaks
         ],
     }
 

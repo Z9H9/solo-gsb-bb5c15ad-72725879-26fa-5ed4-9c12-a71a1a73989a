@@ -183,6 +183,78 @@ curl -X POST http://localhost:8000/api/v1/neutral-profile \
   -d '{"formula":"C6H12O6","resolving_power":100000,"mass_step":0.001}'
 ```
 
+### `POST /api/v1/profile-centroid`
+
+将客户端提交的**等间距连续轮廓**（mass/intensity 点列）转换为**质心峰**（centroid peaks）：校验网格后按基峰归一化并过滤低强度点，把平顶局部极大区间识别为候选峰，经最小间距非极大值抑制后，将保留点分配给最近的候选峰，输出质心质量、峰顶强度与强度占比。
+
+请求体：
+
+```json
+{
+  "points": [
+    {"mass": 100.0, "intensity": 5.0},
+    {"mass": 100.1, "intensity": 40.0},
+    {"mass": 100.2, "intensity": 100.0},
+    {"mass": 100.3, "intensity": 42.0},
+    {"mass": 100.4, "intensity": 6.0},
+    {"mass": 100.5, "intensity": 3.0},
+    {"mass": 100.6, "intensity": 25.0},
+    {"mass": 100.7, "intensity": 80.0},
+    {"mass": 100.8, "intensity": 80.0},
+    {"mass": 100.9, "intensity": 22.0},
+    {"mass": 101.0, "intensity": 4.0}
+  ],
+  "relative_threshold": 2.0,
+  "min_separation": 0.05
+}
+```
+
+- `points`（必填，**3～20000 个**）：连续轮廓点，字段为 `mass`/`intensity`。质量必须**严格递增**且**等间距**——每个相邻步长与全程平均步长（`(末质量 − 首质量)/(点数 − 1)`）的相对误差不超过 **1e-6**；强度非负且至少一个为正。
+- `relative_threshold`（必填，**0～100**）：归一化强度**不高于**（≤）该基峰百分比的点被丢弃，不参与峰检测与分配。
+- `min_separation`（必填，**>0**）：保留候选峰之间的最小质量间距（Da），用于非极大值抑制。
+
+处理流程：
+
+1. 强度按基峰归一化（最高点 = 100），丢弃归一化强度 ≤ `relative_threshold` 的点。
+2. 在保留点中识别**平顶局部极大区间**：连续若干个等强度保留点构成一个平台，若平台两侧相邻点强度都严格更低（被丢弃或落在网格外视为更低），该平台即为一个候选峰，位置取**平台中点**质量，强度取平台的归一化强度。
+3. 候选按**强度降序**（同强度时低质量优先）逐个检查并保留：与任一已保留候选的质量间距小于 `min_separation` 的候选被抑制。
+4. 每个阈值以上的点按质量分配给**最近**的保留候选（等距时归低质量候选），以**原始强度**累计。
+5. 每个保留候选输出：质心质量（分配点原始强度的质量加权平均）、峰顶归一化强度、该峰分配强度占总分配强度的百分比。
+
+响应：
+
+```json
+{
+  "point_count": 11,
+  "mass_step": 0.1,
+  "relative_threshold": 2.0,
+  "min_separation": 0.05,
+  "candidate_count": 2,
+  "peak_count": 2,
+  "peaks": [
+    {"mass": 100.202073, "apex_intensity": 100.0, "intensity_percent": 47.420147},
+    {"mass": 100.749065, "apex_intensity": 80.0, "intensity_percent": 52.579853}
+  ]
+}
+```
+
+- `mass_step`：网格的全程平均步长（Da）。
+- `candidate_count`：非极大值抑制前的局部极大候选数；`peak_count`：最终保留的质心峰数。
+- `peaks`：按质心质量**升序**；`apex_intensity` 为峰顶归一化强度（基峰 = 100），`intensity_percent` 为该峰分配强度占全部分配强度的百分比（各峰之和为 100）。上例中第二个峰来自 100.7/100.8 两处等强度点构成的平顶平台，候选位置取平台中点 100.75。
+- 网格非法（点数不在 3～20000、质量非严格递增、步长相对误差超 1e-6）返回 `invalid_grid`；全零轮廓返回 `all_zero_profile`；阈值以上没有任何局部极大候选（如 `relative_threshold` 取 100）返回 `no_candidates`——均为带 `field`/`index` 的 422，详见[错误定位](#错误定位)。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/profile-centroid \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[{"mass":100.0,"intensity":5.0},{"mass":100.1,"intensity":40.0},
+       {"mass":100.2,"intensity":100.0},{"mass":100.3,"intensity":42.0},
+       {"mass":100.4,"intensity":6.0},{"mass":100.5,"intensity":3.0},
+       {"mass":100.6,"intensity":25.0},{"mass":100.7,"intensity":80.0},
+       {"mass":100.8,"intensity":80.0},{"mass":100.9,"intensity":22.0},
+       {"mass":101.0,"intensity":4.0}],
+       "relative_threshold":2.0,"min_separation":0.05}'
+```
+
 ### `POST /api/v1/ion-identify`
 
 在一个中性分子式上同时评估 **1～20 个候选加合物/电荷组合**：对每个候选复用 `/api/v1/ion-envelope` 的加合物解析与离子包络计算（含 `|charge| ×` 合并容差缩放与 m/z 换算、基峰归一化为 100），将预测 m/z 峰与观测 m/z 峰在容差内一对一配对，以全部配对（含未匹配峰）的强度均方误差对候选排序，返回全部候选的得分、配对明细与最佳候选。
@@ -563,7 +635,22 @@ curl -X POST http://localhost:8000/api/v1/ion-mixture-fit \
   }
   ```
 
-- 参数越界（`step_percent` 超出 0.5～10、`mass_tolerance` 非正、`labels` 不是恰好两个、峰数超过 200、强度为负、`resolving_power`/`mass_step` 非正、`mass_min`/`mass_max` 为 0 或非有限值等）由请求校验返回标准 422 并指明字段位置。
+- `invalid_grid`：`/api/v1/profile-centroid` 的轮廓网格非法——点数不在 3～20000、质量非严格递增，或相邻步长与全程平均步长的相对误差超过 1e-6；`field` 为 `points`，`index` 为出错点的 0 基索引（点数越界时为 `null`）。
+- `all_zero_profile`：轮廓强度全为零（至少需要一个正强度点）；`field` 为 `points`，`index` 为 `null`。
+- `no_candidates`：阈值过滤后没有任何局部极大候选峰（`relative_threshold` 过高，如取 100）；`field` 为 `relative_threshold`，`index` 为 `null`。
+
+  ```json
+  {
+    "detail": {
+      "error": "invalid_grid",
+      "message": "Non-uniform mass grid: step 0.1 at index 1 deviates from the mean step 0.075 by more than 1e-06 relative",
+      "field": "points",
+      "index": 1
+    }
+  }
+  ```
+
+- 参数越界（`step_percent` 超出 0.5～10、`mass_tolerance` 非正、`labels` 不是恰好两个、峰数超过 200、强度为负、`resolving_power`/`mass_step` 非正、`mass_min`/`mass_max` 为 0 或非有限值、`relative_threshold` 超出 0～100、`min_separation` 非正、轮廓点数不在 3～20000 等）由请求校验返回标准 422 并指明字段位置。
 
 ### 其他端点
 
@@ -596,6 +683,7 @@ pytest                                 # 运行测试
 - **峰合并**：排序后相邻质量差 < 0.0001 Da 的峰融合为一个，质量取强度加权平均，强度取和。
 - **离子包络**：`POST /api/v1/ion-envelope` 将加合物（`app/adduct.py`，形如 `+2H-H2O` 的连续片段，系数乘整个片段）施加到解析后的原子计数上，用 `|charge| × MSPC_MERGE_TOLERANCE` 的中性质量容差卷积，再按 `(mass − charge·mₑ)/|charge|`（`mₑ = 0.000548579909065 Da`）逐峰换算为 m/z。
 - **仪器轮廓模拟**：`POST /api/v1/neutral-profile`（`app/profile.py`）复用中性包络卷积得到全部棒峰，对每根质量 m 的棒构造 `FWHM = m/resolving_power`、`σ = FWHM/(2√(2 ln 2))` 的高斯核，只在 ±4σ 内逐点累加到同一张等间距网格（`mass_step`），区间外的核截断、区间内贡献原样保留，再将全图基峰归一化为 100。省略范围时取所有棒 ±4σ 支撑窗的并集；网格点数超过 20000、区间为空/反向、步长非正或区间内无有效采样点均返回带 `field` 的 422。
+- **轮廓质心化**：`POST /api/v1/profile-centroid`（`app/centroid.py`）先校验等间距网格（3～20000 点、质量严格递增、各相邻步长与全程平均步长的相对误差 ≤ 1e-6、强度非负且至少一个为正），基峰归一化后丢弃归一化强度 ≤ `relative_threshold` 的点；在连续等强度保留点构成的"平台"中寻找两侧严格更低的局部极大区间作为候选峰（位置取平台中点），按强度降序（同强度低质量优先）做 `min_separation` 非极大值抑制；阈值以上点按最近候选质量分配（等距归低质量候选，候选质量有序故二分定位），以原始强度计算质心质量、峰顶归一化强度与占总分配强度百分比，按质心质量升序返回。非法网格、全零轮廓或无候选分别返回 `invalid_grid`/`all_zero_profile`/`no_candidates`（带 `field`/`index` 的 422）。
 - **离子识别**：`POST /api/v1/ion-identify`（`app/identify.py`）对 1～20 个候选（加合物, 电荷）逐个复用同一套加合物解析、离子包络计算与基峰归一化，观测峰同样归一化一次后复用；每个候选用与富集拟合相同的 `pair_and_score` 做容差内质量差全局从小到大的一对一贪心匹配，未匹配峰以零强度计入归一化 MSE。有效候选按 MSE 升序、输入索引作稳定平局键排序；非法候选捕获既有 `AdductError`（携带位置）后以 `valid: false` 附在结果末尾，不影响其他候选评分。
 - **离子混合拟合**：`POST /api/v1/ion-mixture-fit`（`app/mixture.py`）对 2～10 个候选中的每个有效候选复用 `app/identify.py` 的基峰归一化离子包络；枚举无序候选对（按请求索引升序，索引较小者为第一候选）与 0～100% 的第一候选比例网格（复用富集拟合的 `abundance_grid`，100% 端点始终包含），将两个归一化包络按比例加权叠加——两包络间 `mass_tolerance` 内的峰按强度加权质量融合、强度求和（复用 `merge_peaks`；比例为 0%/100% 时跳过另一侧，即纯包络）——混合谱再次基峰归一化后与观测峰做同一套 `pair_and_score` 一对一配对，双侧未匹配峰以零强度计入 MSE。全部组合按 (MSE, 候选索引对, 第一候选比例) 升序排名，首名即最佳组合（平局依次取较小索引对、较低首候选比例）；非法候选以 `valid: false` 返回既有位置错误并跳过其所有组合，有效候选少于两个时组合列表为空、最佳组合为 `null`。
 - **单同位素质量**：按 IUPAC 惯例取各元素天然丰度最高的同位素质量之和。
